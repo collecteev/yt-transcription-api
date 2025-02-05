@@ -1,6 +1,8 @@
-flask
-python-dotenv
+Flask
 youtube_transcript_api
+yt-dlp
 openai
-tiktoken
+whisper
+ffmpeg-python
+python-dotenv
 gunicorn
