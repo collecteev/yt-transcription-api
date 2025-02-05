@@ -41,15 +41,16 @@ def process_transcript(video_id):
         return None  # If transcript fails, we use Whisper AI fallback
 
 def download_audio(video_url):
-    """Downloads audio using yt-dlp."""
+    """Downloads audio using yt-dlp with authentication cookies."""
     try:
         ydl_opts = {
             'format': 'bestaudio/best',
             'outtmpl': '-',
             'quiet': True,
             'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
+            'cookiefile': os.getenv("YOUTUBE_COOKIES")  # Load cookies
         }
-        
+
         if PROXY:
             ydl_opts['proxy'] = PROXY
 
@@ -57,12 +58,13 @@ def download_audio(video_url):
             ydl_opts['outtmpl'] = tmpfile.name
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([video_url])
-            
+
             return tmpfile.name  # Return path to downloaded file
 
     except Exception as e:
         logger.error(f"Audio download failed: {e}")
         return None
+
 
 def transcribe_audio(audio_path):
     """Transcribes audio using Whisper AI."""
