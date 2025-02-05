@@ -1,82 +1,86 @@
 from flask import Flask, request, jsonify
 from youtube_transcript_api import YouTubeTranscriptApi
-import re
 import yt_dlp
+import re
 import openai
 import os
 from auth import require_custom_authentication
 from dotenv import load_dotenv
 import logging
-import asyncio
-import whisper
-import ffmpeg
+import tempfile
 
 load_dotenv()
 
 app = Flask(__name__)
 
-# Set up logging
+# Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# OpenAI API Key
+# OpenAI API key
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-client = openai.OpenAI(api_key=OPENAI_API_KEY)
 
-# Proxy settings
+# Proxy setup
 PROXY = os.getenv("PROXY")
 
+# Whisper API client
+client = openai.OpenAI(api_key=OPENAI_API_KEY)
+
 def get_youtube_id(url):
-    """Extract video ID from YouTube URL."""
+    """Extracts video ID from YouTube URL."""
     video_id = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
     return video_id.group(1) if video_id else None
 
 def process_transcript(video_id):
-    """Attempt to fetch subtitles from YouTube. Fallback to Whisper AI if unavailable."""
+    """Retrieves YouTube transcript if available."""
     try:
         transcript = YouTubeTranscriptApi.get_transcript(video_id, proxies={"http": PROXY, "https": PROXY})
-        full_text = ' '.join([entry['text'] for entry in transcript])
-        return full_text
+        return ' '.join([entry['text'] for entry in transcript])
     except Exception as e:
-        logger.warning(f"⚠️ No subtitles found. Falling back to Whisper AI... {e}")
-        return process_whisper_transcription(video_id)
+        logger.warning(f"Transcript unavailable for {video_id}: {e}")
+        return None  # If transcript fails, we use Whisper AI fallback
 
-def download_audio(video_id):
-    """Download YouTube audio without storing it on disk."""
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
-        'outtmpl': '-',  # Direct output to stdout (memory)
-    }
+def download_audio(video_url):
+    """Downloads audio using yt-dlp."""
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            result = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-            return result['url']
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': '-',
+            'quiet': True,
+            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
+        }
+        
+        if PROXY:
+            ydl_opts['proxy'] = PROXY
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmpfile:
+            ydl_opts['outtmpl'] = tmpfile.name
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([video_url])
+            
+            return tmpfile.name  # Return path to downloaded file
+
     except Exception as e:
-        logger.error(f"Error downloading audio: {e}")
+        logger.error(f"Audio download failed: {e}")
         return None
 
-def process_whisper_transcription(video_id):
-    """Download & transcribe audio using Whisper AI."""
-    audio_url = download_audio(video_id)
-    
-    if not audio_url:
-        return "Error: Could not retrieve audio for Whisper AI."
-
+def transcribe_audio(audio_path):
+    """Transcribes audio using Whisper AI."""
     try:
-        logger.info("🔹 Downloading and processing audio via Whisper AI...")
-        audio = whisper.load_audio(audio_url)
-        model = whisper.load_model("base")
-        result = model.transcribe(audio)
-        return result["text"]
+        with open(audio_path, "rb") as audio_file:
+            transcript = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file
+            )
+        return transcript.text
     except Exception as e:
-        logger.error(f"❌ Whisper AI transcription failed: {e}")
-        return "Error: Whisper AI failed to transcribe the audio."
+        logger.error(f"Whisper AI transcription failed: {e}")
+        return None
 
 @app.route('/transcribe', methods=['POST'])
 @require_custom_authentication
 def transcribe():
-    """Main API route for transcription."""
+    """Handles transcription requests."""
     youtube_url = request.json.get('url')
     if not youtube_url:
         return jsonify({"error": "No YouTube URL provided"}), 400
@@ -85,13 +89,25 @@ def transcribe():
     if not video_id:
         return jsonify({"error": "Invalid YouTube URL"}), 400
 
-    try:
-        logger.info(f"Processing video: {video_id}")
-        transcript_text = process_transcript(video_id)
-        return jsonify({"result": transcript_text})
-    except Exception as e:
-        logger.exception(f"An unexpected error occurred: {e}")
-        return jsonify({"error": "An unexpected error occurred"}), 500
+    logger.info(f"Processing video: {video_id}")
+
+    # Try to get transcript from YouTube first
+    transcript_text = process_transcript(video_id)
+
+    # If transcript is missing, fallback to Whisper AI
+    if not transcript_text:
+        logger.info(f"Using Whisper AI for {video_id}")
+        audio_path = download_audio(youtube_url)
+
+        if not audio_path:
+            return jsonify({"error": "Could not retrieve audio for Whisper AI."}), 500
+
+        transcript_text = transcribe_audio(audio_path)
+
+    if not transcript_text:
+        return jsonify({"error": "Transcription failed."}), 500
+
+    return jsonify({"result": transcript_text})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
